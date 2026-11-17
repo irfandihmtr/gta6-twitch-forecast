@@ -1,69 +1,84 @@
-// gta6-twitch-ccu-forecast-01 — Candidate C
-// Analog days (k-NN): pick the 8 past launches whose scale best matches this
-// case — distance on log hour-1 viewers plus log mean viewers over the 24
-// hours before release — and take the empirical quantiles of those analogs'
-// release-day log-ratios per hour.
+// gta6-twitch-ccu-forecast-01 — Candidate D
+// Hierarchical: diurnal shape from all comparables, but each launch's
+// log-ratios enter the per-hour quantiles with a similarity weight — a
+// Gaussian kernel on log hour-1 viewers, on log pre-release level (mean of
+// the 24h before release), and on log hour-1 channels when both sides have
+// them. Weighted empirical quantiles per hour; no hard neighbour cut.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const LEVELS: number[] = [0.05, 0.25, 0.5, 0.75, 0.95];
-const K = 8;
+const SIGMA = 0.75;
 
 type HourPt = { from: string; viewers: number | null; channels: number | null };
 type Comparable = { name: string; day_start: string; hourly: HourPt[] };
 type Case = {
   id: string;
   day_start: string;
-  known: { hour: number; viewers: number }[];
+  known: { hour: number; viewers: number; channels: number | null }[];
   history_hourly: { from: string; viewers: number | null }[];
   comparables: Comparable[];
 };
 
-function quantileOf(sorted: number[], tau: number): number {
-  if (sorted.length === 1) return sorted[0];
-  const pos = (sorted.length - 1) * tau;
-  const lo = Math.floor(pos);
-  const hi = Math.ceil(pos);
-  if (lo === hi) return sorted[lo];
-  const frac = pos - lo;
-  return sorted[lo] * (1 - frac) + sorted[hi] * frac;
-}
-
 type Launch = {
   y1: number;
-  pre: number | null; // mean log viewers, 24h before release day
+  ch1: number | null;
+  pre: number | null;
   ratios: Map<number, number>;
 };
 
 function launchOf(comp: Comparable): Launch | null {
   const t0 = Date.parse(comp.day_start);
   if (!Number.isFinite(t0)) return null;
-  const byOffset = new Map<number, number>();
+  const byOffset = new Map<number, HourPt>();
   for (const pt of comp.hourly) {
     if (pt.viewers === null || pt.viewers === undefined || pt.viewers <= 0) continue;
     const off = Math.round((Date.parse(pt.from) - t0) / 3600000);
-    byOffset.set(off, pt.viewers);
+    byOffset.set(off, pt);
   }
-  const y1 = byOffset.get(0);
-  if (y1 === undefined || y1 <= 0) return null;
+  const first = byOffset.get(0);
+  if (first === undefined) return null;
   let dayCount = 0;
   for (let off = 0; off <= 23; off++) if (byOffset.has(off)) dayCount++;
   if (dayCount < 20) return null;
+  const y1 = first.viewers as number;
   const ratios = new Map<number, number>();
-  for (const [off, v] of byOffset) {
-    if (off >= 1 && off <= 23) ratios.set(off + 1, Math.log(v / y1));
+  for (const [off, pt] of byOffset) {
+    if (off >= 1 && off <= 23) ratios.set(off + 1, Math.log((pt.viewers as number) / y1));
   }
   const preVals: number[] = [];
   for (let off = -24; off <= -1; off++) {
-    const v = byOffset.get(off);
-    if (v !== undefined) preVals.push(Math.log(v));
+    const pt = byOffset.get(off);
+    if (pt !== undefined) preVals.push(Math.log(pt.viewers as number));
   }
   const pre = preVals.length >= 8 ? preVals.reduce((a, b) => a + b, 0) / preVals.length : null;
-  return { y1, pre, ratios };
+  const ch1 = first.channels !== null && first.channels !== undefined && first.channels > 0
+    ? first.channels : null;
+  return { y1, ch1, pre, ratios };
+}
+
+function weightedQuantile(pairs: { v: number; w: number }[], tau: number): number {
+  const s = pairs.slice().sort((a, b) => a.v - b.v);
+  const total = s.reduce((a, x) => a + x.w, 0);
+  if (total <= 0) return s[0].v;
+  const target = tau * total;
+  let acc = 0;
+  for (let i = 0; i < s.length; i++) {
+    acc += s[i].w;
+    if (acc >= target) {
+      if (i === 0) return s[i].v;
+      const prevAcc = acc - s[i].w;
+      const frac = (target - prevAcc) / s[i].w;
+      return s[i - 1].v + frac * (s[i].v - s[i - 1].v);
+    }
+  }
+  return s[s.length - 1].v;
 }
 
 function forecast(c: Case): { hour: number; q: number[] }[] {
   const p = Math.max(c.known[0].viewers, 1);
+  const chT = c.known[0].channels !== null && c.known[0].channels !== undefined && c.known[0].channels > 0
+    ? c.known[0].channels : null;
   const t0 = Date.parse(c.day_start);
   const preVals: number[] = [];
   for (const pt of c.history_hourly ?? []) {
@@ -78,25 +93,23 @@ function forecast(c: Case): { hour: number; q: number[] }[] {
     const l = launchOf(comp);
     if (l !== null) launches.push(l);
   }
-  const scored = launches.map((l) => {
-    let d = Math.abs(Math.log(l.y1) - Math.log(p));
-    if (preTarget !== null && l.pre !== null) d += Math.abs(l.pre - preTarget);
-    else d *= 2;
-    return { l, d };
+  const weighted = launches.map((l) => {
+    let d2 = Math.pow(Math.log(l.y1) - Math.log(p), 2);
+    if (preTarget !== null && l.pre !== null) d2 += Math.pow(l.pre - preTarget, 2);
+    if (chT !== null && l.ch1 !== null) d2 += Math.pow(Math.log(l.ch1) - Math.log(chT), 2);
+    return { l, w: Math.exp(-d2 / (2 * SIGMA * SIGMA)) };
   });
-  scored.sort((a, b) => a.d - b.d);
-  const analogs = scored.slice(0, K).map((s) => s.l);
-  const pool = analogs.length > 0 ? analogs : launches;
 
   const hours: { hour: number; q: number[] }[] = [];
   for (let h = 2; h <= 24; h++) {
-    const s = pool
-      .map((l) => l.ratios.get(h))
-      .filter((v): v is number => v !== undefined)
-      .sort((a, b) => a - b);
+    const pairs: { v: number; w: number }[] = [];
+    for (const { l, w } of weighted) {
+      const r = l.ratios.get(h);
+      if (r !== undefined) pairs.push({ v: r, w });
+    }
     let prev = 0;
     const q = LEVELS.map((tau) => {
-      const r = s.length > 0 ? quantileOf(s, tau) : 0;
+      const r = pairs.length > 0 ? weightedQuantile(pairs, tau) : 0;
       let v = p * Math.exp(r);
       v = Math.min(Math.max(v, 0.01), 1000000000);
       v = Math.max(v, prev);
