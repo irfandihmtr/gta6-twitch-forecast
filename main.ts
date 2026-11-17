@@ -8,6 +8,12 @@ import { join } from "node:path";
 
 const LEVELS: number[] = [0.05, 0.25, 0.5, 0.75, 0.95];
 const K = 8;
+// Analog-distance weights: hour-1 scale and pre-release level count equally.
+// When the pre-release level is missing on either side, the hour-1 term is
+// scaled by W_MISSING_PRE so distances stay comparable across launches.
+const W_HOUR1 = 1;
+const W_PRE = 1;
+const W_MISSING_PRE = 2;
 
 type HourPt = { from: string; viewers: number | null; channels: number | null };
 type Comparable = { name: string; day_start: string; hourly: HourPt[] };
@@ -79,9 +85,9 @@ function forecast(c: Case): { hour: number; q: number[] }[] {
     if (l !== null) launches.push(l);
   }
   const scored = launches.map((l) => {
-    let d = Math.abs(Math.log(l.y1) - Math.log(p));
-    if (preTarget !== null && l.pre !== null) d += Math.abs(l.pre - preTarget);
-    else d *= 2;
+    let d = W_HOUR1 * Math.abs(Math.log(l.y1) - Math.log(p));
+    if (preTarget !== null && l.pre !== null) d += W_PRE * Math.abs(l.pre - preTarget);
+    else d *= W_MISSING_PRE;
     return { l, d };
   });
   scored.sort((a, b) => a.d - b.d);
