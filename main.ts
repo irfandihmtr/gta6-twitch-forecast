@@ -1,13 +1,12 @@
-// gta6-twitch-ccu-forecast-01 — Candidate A
-// Diurnal shape from comparables: for every past launch in the case, take the
-// log-ratio r_h = log(y_h / y_1) of each release-day hour against its hour 1.
-// The forecast for hour h is hour 1 of this case times the empirical quantiles
-// of r_h across launches, one quantile per requested level. No model, no
-// network, deterministic.
+// gta6-twitch-ccu-forecast-01 — Candidate B
+// Baseline house spread, diurnal median: the median follows the comparables'
+// median log-ratio curve (as in Candidate A), but the spread is the house
+// baseline's normal spread, 0.15 * sqrt(h - 1), around that median.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const LEVELS: number[] = [0.05, 0.25, 0.5, 0.75, 0.95];
+const Z: number[] = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
 
 type HourPt = { from: string; viewers: number | null; channels: number | null };
 type Comparable = { name: string; day_start: string; hourly: HourPt[] };
@@ -18,7 +17,6 @@ type Case = {
   comparables: Comparable[];
 };
 
-// Interpolated quantile (type 7) of an ascending-sorted sample.
 function quantileOf(sorted: number[], tau: number): number {
   if (sorted.length === 1) return sorted[0];
   const pos = (sorted.length - 1) * tau;
@@ -29,9 +27,6 @@ function quantileOf(sorted: number[], tau: number): number {
   return sorted[lo] * (1 - frac) + sorted[hi] * frac;
 }
 
-// Release-day log-ratios for one comparable, or null when its release day is
-// not a real launch day in the data (hour 1 missing, or the day is sparse —
-// the pre-release category history in the case fails both tests).
 function launchRatios(comp: Comparable): Map<number, number> | null {
   const t0 = Date.parse(comp.day_start);
   if (!Number.isFinite(t0)) return null;
@@ -63,12 +58,13 @@ function forecast(c: Case): { hour: number; q: number[] }[] {
   const hours: { hour: number; q: number[] }[] = [];
   for (let h = 2; h <= 24; h++) {
     const s = (samples.get(h) ?? []).slice().sort((a, b) => a - b);
+    const med = s.length > 0 ? quantileOf(s, 0.5) : 0;
+    const spread = 0.15 * Math.sqrt(h - 1);
     let prev = 0;
-    const q = LEVELS.map((tau) => {
-      const r = s.length > 0 ? quantileOf(s, tau) : 0;
-      let v = p * Math.exp(r);
+    const q = Z.map((z) => {
+      let v = p * Math.exp(med + z * spread);
       v = Math.min(Math.max(v, 0.01), 1000000000);
-      v = Math.max(v, prev); // quantiles never cross
+      v = Math.max(v, prev);
       prev = v;
       return Math.round(v * 100) / 100;
     });
